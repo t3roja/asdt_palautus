@@ -13,6 +13,9 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <cstring> // memcpy ja memset varten
+#include <cstdlib> // lisätty exit varten
+#include <sys/ipc.h> // kirjasto jaetulle muistille
 
 //rinnakaisuuden peruskirjastot
 //OPISKLEIJA: lisää tarvittaessa lisää kirjastoja, muista käyttää -pthread lippua käännöksessä ja tarvittaessa -lrt lippua myös
@@ -142,6 +145,21 @@ int labyrintti[KORKEUS][LEVEYS] = {
     {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,4,1,1},
 };
 
+// aetun muistin rakenne sijaintikartalle
+struct JaettuMuisti {
+    int sijaintikartta[KORKEUS][LEVEYS];
+};
+
+// Globaalit muuttujat jaetulle muistille
+int shm_id;
+JaettuMuisti* jaettu_muisti;
+
+// Semaforit ja mutexit
+sem_t* kirjoitus_semafori;
+pthread_mutex_t sijainti_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define ROTTIEN_MAARA 4
+
 //apuja: voit testata ratkaisujasi myös alla olevalla yksinkertaisemmalla labyrintilla 
 //#define KORKEUS 7
 //#define LEVEYS 7
@@ -198,6 +216,39 @@ struct Ristaus {
     LiikkumisSuunta tutkittavana = DEFAULT; //alkuarvo, kertoo while-silmukan alussa olevalle risteyskoodille että rotta tuli ensimmäistä kertaa ko risteykseen
 };
 
+// Alustusfunktio jaetulle muistille sijaintikartalle
+void alusta_jaettu_muisti() {
+    // Luodaan jaettu muistialue
+    shm_id = shmget(IPC_PRIVATE, sizeof(JaettuMuisti), IPC_CREAT | 0666);
+    if (shm_id == -1) {
+        perror("shmget failed");
+        exit(1);
+    }
+    
+    // Liitetään jaettu muisti
+    jaettu_muisti = (JaettuMuisti*)shmat(shm_id, NULL, 0);
+    if (jaettu_muisti == (void*)-1) {
+        perror("shmat failed");
+        exit(1);
+    }
+    
+    // Alustetaan sijaintikartta
+    memset(jaettu_muisti->sijaintikartta, 0, sizeof(jaettu_muisti->sijaintikartta));
+    
+    cout << "Jaettu muisti alustettu" << endl;
+}
+
+// Alustusfunktio semaforeille
+void alusta_semaforit() {
+    sem_unlink("/labyrintti_semafori");
+    kirjoitus_semafori = sem_open("/labyrintti_semafori", O_CREAT | O_EXCL, 0644, 1);
+    if (kirjoitus_semafori == SEM_FAILED) {
+        perror("sem_open failed");
+        exit(1);
+    }
+    cout << "Semaforit alustettu" << endl;
+}
+
 //poikkeuksenheittämistä varten, ei käytössä tällä hetkellä
 //PasiM, TODO: poikkeukset
 struct Karttavirhe {
@@ -239,7 +290,37 @@ Sijainti findBegin(){
     Sijainti alkusijainti;
     alkusijainti = etsiKartasta(3);
     return alkusijainti;
-} 
+}
+
+// Päivitä sijaintikarttaa (prosessiversio)
+void paivita_sijainti_prosessi(int rotta_id, Sijainti uusi_sijainti, Sijainti vanha_sijainti) {
+    sem_wait(kirjoitus_semafori);
+    
+    if (vanha_sijainti.ykoord >= 0 && vanha_sijainti.xkoord >= 0) {
+        int yindex_vanha = KORKEUS-1-vanha_sijainti.ykoord;
+        jaettu_muisti->sijaintikartta[yindex_vanha][vanha_sijainti.xkoord] = 0;
+    }
+    
+    int yindex_uusi = KORKEUS-1-uusi_sijainti.ykoord;
+    jaettu_muisti->sijaintikartta[yindex_uusi][uusi_sijainti.xkoord] = rotta_id + 1;
+    
+    sem_post(kirjoitus_semafori);
+}
+
+// Päivitä sijaintikarttaa (säieversio)
+void paivita_sijainti_saie(int rotta_id, Sijainti uusi_sijainti, Sijainti vanha_sijainti) {
+    pthread_mutex_lock(&sijainti_mutex);
+    
+    if (vanha_sijainti.ykoord >= 0 && vanha_sijainti.xkoord >= 0) {
+        int yindex_vanha = KORKEUS-1-vanha_sijainti.ykoord;
+        jaettu_muisti->sijaintikartta[yindex_vanha][vanha_sijainti.xkoord] = 0;
+    }
+    
+    int yindex_uusi = KORKEUS-1-uusi_sijainti.ykoord;
+    jaettu_muisti->sijaintikartta[yindex_uusi][uusi_sijainti.xkoord] = rotta_id + 1;
+    
+    pthread_mutex_unlock(&sijainti_mutex);
+}
 
 //TÄRKEÄÄ: reitti on risteyspino - sen muutokset täytyy liikkua tiedonvälityksen mukana, siksi liikkuu viittaus siihen
 //OPISKELIJA: rotan liikkumislogiikkaan ei (välttämättä) tarvitse kajota, ainoastaan päätöksentekoon risteyksiin liittyen
@@ -424,6 +505,194 @@ LiikkumisSuunta doRistaus(Sijainti risteyssijainti, LiikkumisSuunta prevDir, aut
 //parametrina tässä siis voi/pitää antaa esimerkiksi että ollaanko prosessina vai threadinä liikkeellä
 //kuljeta parametria/parametreja tarvittavissa paikoissa ohjelmassa
 //ohjelman lopussa reitti vektorissa (käsitellään pinona) on oikean reitin risteykset ainoastaan
+
+// Prosessin rotta-funktio - TEHTÄVÄ 1
+void prosessi_rotta(int rotta_id) {
+    printf("Rotta %d aloittaa (PID: %d)\n", rotta_id, getpid());
+    
+    int liikkuCount = 0;
+    vector<Ristaus> reitti;
+    Sijainti rotanSijainti = findBegin();
+    Sijainti vanhaSijainti = {-1, -1};
+    
+    LiikkumisSuunta prevDir {DEFAULT};
+    LiikkumisSuunta nextDir {DEFAULT};
+    
+    paivita_sijainti_prosessi(rotta_id, rotanSijainti, vanhaSijainti);
+    
+   
+    while (labyrintti[KORKEUS-1-rotanSijainti.ykoord][rotanSijainti.xkoord] != 4) {
+        vanhaSijainti = rotanSijainti;
+        
+        
+        if (labyrintti[KORKEUS-1-rotanSijainti.ykoord][rotanSijainti.xkoord] == 2){
+            nextDir = doRistaus(rotanSijainti, prevDir, reitti);
+        }
+        else nextDir = findNext(false, rotanSijainti, prevDir, reitti);
+        
+        switch (nextDir) {
+        case UP:
+        rotanSijainti = moveUp(rotanSijainti);
+        prevDir = UP;
+        break;
+        case DOWN:
+        rotanSijainti = moveDown(rotanSijainti);
+        prevDir = DOWN;
+        break;
+        case LEFT:
+        rotanSijainti = moveLeft(rotanSijainti);
+        prevDir = LEFT;
+        break;
+        case RIGHT:
+        rotanSijainti = moveRight(rotanSijainti);
+        prevDir = RIGHT;
+        break;
+        case DEFAULT:
+        if (!reitti.empty()) {
+            rotanSijainti.ykoord = reitti.back().kartalla.ykoord;
+            rotanSijainti.xkoord = reitti.back().kartalla.xkoord;
+            switch (reitti.back().tutkittavana){
+            case UP:
+                reitti.back().up.tutkittu = true;
+                reitti.back().up.jatkom = OPENING;
+                break;
+            case DOWN:
+                reitti.back().down.tutkittu = true;
+                reitti.back().down.jatkom = OPENING;
+                break;
+            case LEFT:
+                reitti.back().left.tutkittu = true;
+                reitti.back().left.jatkom = OPENING;
+                break;
+            case RIGHT:
+                reitti.back().right.tutkittu = true;
+                reitti.back().right.jatkom = OPENING;
+                break;
+            default:
+                break;
+            } 
+        }
+        break;
+    }
+    
+        paivita_sijainti_prosessi(rotta_id, rotanSijainti, vanhaSijainti);
+        
+        liikkuCount++;
+        usleep(1000 + (rotta_id * 100));
+    }
+    
+    printf("Rotta %d pääsi ulos! Liikkeitä: %d\n", rotta_id, liikkuCount);
+    exit(0);
+}
+
+// MUUTOS: Pääfunktio prosessiversiolle - TEHTÄVÄ 1
+void prosessi_toteutus() {
+
+    alusta_jaettu_muisti();
+    alusta_semaforit();
+    
+    pid_t pid;
+    int rottia_elossa = ROTTIEN_MAARA;
+    
+    for (int i = 0; i < ROTTIEN_MAARA; i++) {
+        pid = fork();
+        if (pid == 0) {
+            prosessi_rotta(i);
+        } else if (pid < 0) {
+            perror("fork failed");
+        }
+    }
+    
+    while (rottia_elossa > 0) {
+        int status;
+        pid_t finished_pid = wait(&status);
+        if (finished_pid > 0) {
+            rottia_elossa--;
+            printf("Rotta-prosessi %d valmis, %d rottia jäljellä\n", finished_pid, rottia_elossa);
+        }
+    }
+    
+    shmdt(jaettu_muisti);
+    shmctl(shm_id, IPC_RMID, NULL);
+    sem_close(kirjoitus_semafori);
+    sem_unlink("/labyrintti_semafori");
+    
+    cout << "Kaikki rotat ulkona prosesseina!" << endl;
+}
+
+// Säikeen rotta-funktio - TEHTÄVÄ 2
+void* saie_rotta(void* arg) {
+    int rotta_id = *(int*)arg;
+    printf("Rotta-säie %d aloittaa\n", rotta_id);
+    
+    int liikkuCount = 0;
+    vector<Ristaus> reitti;
+    Sijainti rotanSijainti = findBegin();
+    Sijainti vanhaSijainti = {-1, -1};
+    
+    LiikkumisSuunta prevDir {DEFAULT};
+    LiikkumisSuunta nextDir {DEFAULT};
+    
+    paivita_sijainti_saie(rotta_id, rotanSijainti, vanhaSijainti);
+    
+    while (labyrintti[KORKEUS-1-rotanSijainti.ykoord][rotanSijainti.xkoord] != 4) {
+        vanhaSijainti = rotanSijainti;
+        
+        if (labyrintti[KORKEUS-1-rotanSijainti.ykoord][rotanSijainti.xkoord] == 2) {
+            nextDir = doRistaus(rotanSijainti, prevDir, reitti);
+        } else {
+            nextDir = findNext(false, rotanSijainti, prevDir, reitti);
+        }
+        
+        switch (nextDir) {
+            case UP: rotanSijainti = moveUp(rotanSijainti); prevDir = UP; break;
+            case DOWN: rotanSijainti = moveDown(rotanSijainti); prevDir = DOWN; break;
+            case LEFT: rotanSijainti = moveLeft(rotanSijainti); prevDir = LEFT; break;
+            case RIGHT: rotanSijainti = moveRight(rotanSijainti); prevDir = RIGHT; break;
+            case DEFAULT:
+                if (!reitti.empty()) {
+                    rotanSijainti = reitti.back().kartalla;
+                }
+                break;
+        }
+        
+        paivita_sijainti_saie(rotta_id, rotanSijainti, vanhaSijainti);
+        
+        liikkuCount++;
+        usleep(1000 + (rotta_id * 100));
+    }
+    
+    printf("Rotta-säie %d pääsi ulos! Liikkeitä: %d\n", rotta_id, liikkuCount);
+    pthread_exit(NULL);
+}
+
+// Pääfunktio säietoteutukselle - TEHTÄVÄ 2
+void saie_toteutus() {
+
+    alusta_jaettu_muisti();
+    
+    pthread_t saikeet[ROTTIEN_MAARA];
+    int rotta_idt[ROTTIEN_MAARA];
+    
+    for (int i = 0; i < ROTTIEN_MAARA; i++) {
+        rotta_idt[i] = i;
+        if (pthread_create(&saikeet[i], NULL, saie_rotta, &rotta_idt[i]) != 0) {
+            perror("pthread_create failed");
+        }
+    }
+    
+    for (int i = 0; i < ROTTIEN_MAARA; i++) {
+        pthread_join(saikeet[i], NULL);
+        printf("Rotta-säie %d valmis\n", i);
+    }
+    
+    shmdt(jaettu_muisti);
+    shmctl(shm_id, IPC_RMID, NULL);
+    pthread_mutex_destroy(&sijainti_mutex);
+    
+    cout << "Kaikki rotat ulkona säikeinä!" << endl;
+}
+
 int aloitaRotta(){
     int liikkuCount=0;
     vector<Ristaus> reitti; //pinona käytettävä rotan kulkema reitti (pinossa kuljetut risteykset)
@@ -510,10 +779,22 @@ int aloitaRotta(){
 }
 
 //OPISKELIJA: nykyinen main on näin yksinkertainen, tästä pitää muokata se rinnakkaisuuden pohja
-int main(){
-    aloitaRotta();
-    //tämän tulee kertoa että kaikki rotat ovat päässeet ulos labyrintista
-    //viimeinen jäädytetty kuva sijaintikartasta olisi hyvä olla todistamassa sitä
-    std::cout << "Kaikki rotat ulkona!" << endl;
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        printf("Käyttö: %s [prosessi|saie]\n", argv[0]);
+        printf("Esimerkki: %s prosessi\n", argv[0]);
+        printf("Esimerkki: %s saie\n", argv[0]);
+        return 1;
+    }
+    
+    if (strcmp(argv[1], "prosessi") == 0) {
+        prosessi_toteutus();  // TEHTÄVÄ 1 & 3
+    } else if (strcmp(argv[1], "saie") == 0) {
+        saie_toteutus();      // TEHTÄVÄ 2 & 4
+    } else {
+        printf("Virheellinen valinta. Käytä 'prosessi' tai 'saie'\n");
+        return 1;
+    }
+    
     return 0;
 }
